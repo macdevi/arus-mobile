@@ -5,9 +5,11 @@ from app import db, DB_PATH
 if len(sys.argv)<2:
     raise SystemExit('Usage: python manage.py init-admin | backup /data/backup.sqlite3')
 if sys.argv[1]=='init-admin':
-    p=getpass.getpass('Password baru (14-256 karakter): ')
-    if not 14<=len(p)<=256 or p!=getpass.getpass('Ulangi password: '):
-        raise SystemExit('Password tidak cocok atau panjang tidak valid.')
+    p=getpass.getpass('Password baru (6-256 karakter): ')
+    if not 6<=len(p)<=256:
+        raise SystemExit('Panjang password harus 6-256 karakter. Password belum diubah.')
+    if p!=getpass.getpass('Ulangi password: '):
+        raise SystemExit('Konfirmasi password tidak cocok. Password belum diubah.')
     with db(True) as c:
         c.execute('INSERT OR REPLACE INTO config VALUES(?,?)',('password_hash',generate_password_hash(p)))
         c.execute('INSERT OR REPLACE INTO config VALUES(?,?)',('auth_version',secrets.token_urlsafe(32)))
