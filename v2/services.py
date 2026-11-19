@@ -1,4 +1,4 @@
-"""Domain services. Caller validates settings; no network or background threads."""
+"""Domain services. No network or background threads."""
 from datetime import date, timedelta
 from v2_core import amount, convert, payday_in_month, salary_schedule, salary_key
 from v2.ledger import atomic, post, balances
@@ -22,12 +22,17 @@ def allocate(db, goal_id, currency, delta, occurred_on, rate):
         total = sum(convert(n, cur, goal[0], rate) for cur,n in saved.items())
         if delta > 0 and total > goal[1]:
             raise ValueError('Alokasi melebihi target pada kurs saat ini.')
-        return db.execute('INSERT INTO v2_allocations(goal_id,occurred_on,currency,delta) VALUES(?,?,?,?)',
-                          (goal_id,occurred_on,currency,delta)).lastrowid
+        return db.execute('INSERT INTO v2_allocations(goal_id,occurred_on,currency,delta) VALUES(?,?,?,?)',(goal_id,occurred_on,currency,delta)).lastrowid
 
-def pay_installment(db, loan_id, occurred_on, *, rate=None, rate_date=None, rate_source=None, principal=None):
+def pay_installment(db, loan_id, occurred_on, *, scheduled_for=None, rate=None, rate_date=None, rate_source=None, principal=None):
     date.fromisoformat(occurred_on)
+    period = date.fromisoformat(scheduled_for or occurred_on).isoformat()
     with atomic(db):
+        previous = db.execute('SELECT p.transaction_id,t.occurred_on,p.principal,t.voided_at FROM v2_loan_payments p JOIN v2_transactions t ON t.id=p.transaction_id WHERE p.loan_id=? AND p.scheduled_for=? AND p.voided_at IS NULL',(loan_id,period)).fetchone()
+        if previous:
+            if previous[1] != occurred_on or previous[2] != principal or previous[3] is not None:
+                raise ValueError('Pembayaran periode ini sudah ada dengan rincian berbeda.')
+            return previous[0]
         loan = db.execute('SELECT name,currency,installment,remaining_count,next_due,due_day,outstanding_principal,archived FROM v2_loans WHERE id=?',(loan_id,)).fetchone()
         if not loan or loan[7]:
             raise ValueError('Cicilan tidak ditemukan atau diarsipkan.')
@@ -37,20 +42,20 @@ def pay_installment(db, loan_id, occurred_on, *, rate=None, rate_date=None, rate
         first = date.fromisoformat(loan[4])
         month = first.year*12 + first.month-1 + count
         due = first if count == 0 else payday_in_month(month//12,month%12+1,loan[5])
+        if period != due.isoformat():
+            raise ValueError('Pilih periode cicilan berikutnya secara eksplisit.')
         if principal is not None:
             amount(principal, loan[1])
             if principal > loan[2] or (loan[6] is not None and principal_paid+principal > loan[6]):
                 raise ValueError('Komponen pokok melebihi batas.')
-        if balances(db)[loan[1]] < loan[2]:
-            raise ValueError('Saldo mata uang pembayaran tidak cukup.')
-        tid = post(db,occurred_on=occurred_on,kind='expense',description='Cicilan: '+loan[0],
-                   category='Cicilan',entries=[(loan[1],-loan[2])],rate=rate,rate_date=rate_date,rate_source=rate_source)
-        db.execute('INSERT INTO v2_loan_payments(loan_id,transaction_id,scheduled_for,amount,principal) VALUES(?,?,?,?,?)',
-                   (loan_id,tid,due.isoformat(),loan[2],principal))
+        reserved = db.execute('SELECT COALESCE(SUM(delta),0) FROM v2_allocations WHERE currency=? AND voided_at IS NULL',(loan[1],)).fetchone()[0]
+        if balances(db)[loan[1]] - reserved < loan[2]:
+            raise ValueError('Saldo bebas tidak cukup. Lepaskan alokasi tabungan dahulu.')
+        tid = post(db,occurred_on=occurred_on,kind='expense',description='Cicilan: '+loan[0],category='Cicilan',entries=[(loan[1],-loan[2])],rate=rate,rate_date=rate_date,rate_source=rate_source)
+        db.execute('INSERT INTO v2_loan_payments(loan_id,transaction_id,scheduled_for,amount,principal) VALUES(?,?,?,?,?)',(loan_id,tid,period,loan[2],principal))
         return tid
 
 def process_salary(db, through, rates):
-    """rates maps due-date strings to (rate, rate_date, source). Missing dates wait."""
     through = date.fromisoformat(through)
     created, waiting = [], []
     with atomic(db):
@@ -69,7 +74,5 @@ def process_salary(db, through, rates):
                 rate, rate_date, source = snapshot
                 if date.fromisoformat(rate_date) > due:
                     raise ValueError('Kurs gaji tidak boleh berasal dari masa depan transaksi.')
-                created.append(post(db,occurred_on=due.isoformat(),kind='income',description='Gaji otomatis',
-                    category='Gaji',entries=[('KRW',nominal)],salary_period=period,
-                    rate=rate,rate_date=rate_date,rate_source=source))
+                created.append(post(db,occurred_on=due.isoformat(),kind='income',description='Gaji otomatis',category='Gaji',entries=[('KRW',nominal)],salary_period=period,rate=rate,rate_date=rate_date,rate_source=source))
     return {'created':created,'waiting_for_rate':waiting}
