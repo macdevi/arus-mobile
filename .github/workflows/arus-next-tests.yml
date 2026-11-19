@@ -10,6 +10,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: next
@@ -33,12 +34,33 @@ jobs:
       - run: docker build -t arus-next-ci .
       - name: Start isolated test container
         run: docker run -d --name arus-next-ci --read-only --tmpfs /tmp --tmpfs /data:uid=10001,gid=10001 -e ARUS_NEXT_DB=/data/ci.sqlite3 -e COOKIE_SECURE=false -e SECRET_KEY=ci-only-placeholder-not-for-production-123456789012345678901234567890 -p 127.0.0.1:18081:8000 arus-next-ci
-      - name: Wait for health
-        run: curl --fail --retry 20 --retry-delay 2 --retry-connrefused http://127.0.0.1:18081/health
+      - name: Wait for verified application health
+        timeout-minutes: 3
+        run: |
+          for attempt in $(seq 1 30); do
+            echo "Health attempt ${attempt}/30"
+            if curl --silent --show-error --fail --connect-timeout 1 --max-time 3 --output /tmp/arus-next-health.json http://127.0.0.1:18081/health; then
+              if python -c "import json; data=json.load(open('/tmp/arus-next-health.json')); assert data.get('status') == 'ok', data"; then
+                echo 'Application health verified.'
+                exit 0
+              fi
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' arus-next-ci)" != 'true' ]; then
+              echo 'Container stopped before becoming healthy.'
+              break
+            fi
+            sleep 2
+          done
+          echo 'Application failed its bounded health check.'
+          docker inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{json .State.Error}}' arus-next-ci || true
+          docker logs --tail=200 arus-next-ci || true
+          exit 1
       - run: python tests/browser_smoke.py
-      - name: Container logs
+      - name: Container diagnostics
         if: always()
-        run: docker logs arus-next-ci || true
+        run: |
+          docker inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{json .State.Error}}' arus-next-ci || true
+          docker logs --tail=200 arus-next-ci || true
       - name: Remove test container
         if: always()
         run: docker rm -f arus-next-ci || true
